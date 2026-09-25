@@ -25,7 +25,7 @@
       "id": "dht1",
       "top": -9.3,
       "left": -408.6,
-      "attrs": { "temperature": "23.6", "humidity": "54.5" }
+      "attrs": { "temperature": "18.8", "humidity": "61" }
     },
     {
       "type": "board-ssd1306",
@@ -48,7 +48,7 @@
       "id": "temp2",
       "top": 37.27,
       "left": -226.32,
-      "attrs": { "temperature": "11.6" }
+      "attrs": { "temperature": "43.5" }
     },
     {
       "type": "wokwi-buzzer",
@@ -88,6 +88,20 @@
       "left": -395,
       "rotate": 180,
       "attrs": { "value": "1000" }
+    },
+    {
+      "type": "wokwi-pushbutton-6mm",
+      "id": "btn1",
+      "top": 305,
+      "left": 19.2,
+      "attrs": { "color": "green", "xray": "1" }
+    },
+    {
+      "type": "wokwi-pushbutton-6mm",
+      "id": "btn2",
+      "top": 266.6,
+      "left": 19.2,
+      "attrs": { "color": "green", "xray": "1" }
     }
   ],
   "connections": [
@@ -165,7 +179,11 @@
     [ "led3:A", "bb1:16b.f", "", [ "$bb" ] ],
     [ "led3:C", "bb1:15b.f", "", [ "$bb" ] ],
     [ "led2:A", "bb1:19b.f", "", [ "$bb" ] ],
-    [ "led2:C", "bb1:18b.f", "", [ "$bb" ] ]
+    [ "led2:C", "bb1:18b.f", "", [ "$bb" ] ],
+    [ "btn2:1.l", "esp:32", "green", [ "v-134.4", "h-307.2", "v115.2" ] ],
+    [ "btn1:1.r", "bb2:tn.13", "blue", [ "v0" ] ],
+    [ "btn2:1.r", "bb2:tn.10", "blue", [ "v0" ] ],
+    [ "btn1:1.l", "esp:33", "green", [ "v105.6", "h-307.2", "v-153.6" ] ]
   ],
   "dependencies": {}
 }

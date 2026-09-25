@@ -2,12 +2,15 @@
 // FloraGuard
 // Automated Commercial Micro-Climate Nursery
 //
-// Commit 8:
+// Commit 9:
 // - Sensor validation
 // - Safety / Error mode
 // - Safe vent posture
 // - OLED fault indication
 // - State LED blinking in safety mode
+// - Physical AUTO and MANUAL push buttons
+// - Manual Override suspends automatic controls
+// - Manual Override locks vent fully open
 //
 // Current hardware:
 // DHT22   -> GPIO15
@@ -20,7 +23,7 @@
 // State LED -> GPIO23
 //
 // IMPORTANT:
-// No delay() is used. Timing uses millis().
+// All timing is non-blocking and uses millis().
 // ============================================================
 
 #include <DHTesp.h>
@@ -47,6 +50,9 @@ const int BUZZER_PIN = 25;
 
 const int GROW_LED = 19;
 const int STATE_LED = 23;
+
+const int AUTO_BUTTON = 32;
+const int MANUAL_BUTTON = 33;
 
 // ============================================================
 // SYSTEM MODES
@@ -124,6 +130,28 @@ const int SAFE_VENT_POSITION = 100;
 int ventPosition = 50;
 
 // ============================================================
+// EXTREME CLIMATE / CONFLICT-RESOLUTION CONTROL
+// ============================================================
+//
+// Main design challenge:
+// HOT INSIDE + COLD OUTSIDE
+//
+// Normal ventilation:
+//   Indoor < 27 C       -> 50%
+//   Indoor 27-29.9 C    -> 75%
+//   Indoor >= 30 C      -> 100%
+//
+// If outdoor air is cold (<= 15 C), the vent opening is limited:
+//   Indoor 27-29.9 C + Outdoor <= 15 C -> 50%
+//   Indoor >= 30 C   + Outdoor <= 15 C -> 75%
+//
+// Safety and Manual Override always have higher priority.
+// ============================================================
+
+const float COLD_OUTDOOR_THRESHOLD = 15.0;
+bool hotInsideColdOutside = false;
+
+// ============================================================
 // TIMING
 // ============================================================
 
@@ -152,6 +180,25 @@ const unsigned long OLED_INTERVAL = 500;
 unsigned long lastStateBlink = 0;
 const unsigned long STATE_BLINK_INTERVAL = 300;
 bool stateLEDState = false;
+
+// ============================================================
+// PHYSICAL MODE BUTTONS
+// ============================================================
+
+bool lastAutoButtonReading = HIGH;
+bool lastManualButtonReading = HIGH;
+
+bool autoButtonState = HIGH;
+bool manualButtonState = HIGH;
+
+unsigned long autoButtonDebounceTime = 0;
+unsigned long manualButtonDebounceTime = 0;
+
+const unsigned long BUTTON_DEBOUNCE = 50;
+
+// Non-blocking button diagnostics
+unsigned long lastButtonDiagnostic = 0;
+const unsigned long BUTTON_DIAGNOSTIC_INTERVAL = 1000;
 
 // Buzzer
 unsigned long buzzerStartTime = 0;
@@ -269,6 +316,29 @@ void setup() {
   Serial.println("State Light GPIO23 initialized");
 
   // ----------------------------------------------------------
+  // MODE BUTTONS
+  // ----------------------------------------------------------
+
+  pinMode(AUTO_BUTTON, INPUT_PULLUP);
+  pinMode(MANUAL_BUTTON, INPUT_PULLUP);
+
+  // Capture the initial electrical states so a held/released
+  // button at startup does not create a false transition.
+  lastAutoButtonReading = digitalRead(AUTO_BUTTON);
+  autoButtonState = lastAutoButtonReading;
+
+  lastManualButtonReading = digitalRead(MANUAL_BUTTON);
+  manualButtonState = lastManualButtonReading;
+
+  Serial.println("AUTO Button GPIO32 initialized");
+  Serial.println("MANUAL Button GPIO33 initialized");
+
+  Serial.println("Button wiring test:");
+  Serial.println("AUTO   = GPIO32 -> button -> GND");
+  Serial.println("MANUAL = GPIO33 -> button -> GND");
+  Serial.println("Released = HIGH, Pressed = LOW");
+
+  // ----------------------------------------------------------
   // START DS18B20 CONVERSION
   // ----------------------------------------------------------
 
@@ -288,10 +358,19 @@ void setup() {
   Serial.println();
   Serial.println("SYSTEM MODE: AUTOMATION");
   Serial.println();
-  Serial.println("Serial commands:");
+  Serial.println("Physical controls:");
+  Serial.println("AUTO button  = GPIO32");
+  Serial.println("MANUAL button = GPIO33");
+  Serial.println();
+  Serial.println("Serial test commands:");
   Serial.println("A = Automation");
   Serial.println("M = Manual Override");
-  Serial.println("E = Emergency");
+  Serial.println("E = Emergency / Safety test");
+  Serial.println("S = Show current system status");
+  Serial.println("R = Reset Safety when sensors are valid");
+  Serial.println();
+  Serial.println("EXTREME CLIMATE RULE:");
+  Serial.println("Hot inside + outdoor <= 15 C -> vent is limited");
 }
 
 // ============================================================
@@ -523,6 +602,18 @@ void handleSafetyMode() {
 
 void controlGrowLight() {
 
+  // Manual Override suspends automatic grow-light control.
+  if (currentMode == MANUAL_MODE || currentMode == EMERGENCY_MODE || safetyMode) {
+
+    digitalWrite(GROW_LED, LOW);
+    return;
+  }
+
+  // Only AUTOMATION mode controls the grow light automatically.
+  if (currentMode != AUTOMATION_MODE) {
+    return;
+  }
+
   if (lightPercentage < 30) {
 
     digitalWrite(GROW_LED, HIGH);
@@ -546,11 +637,22 @@ void controlGrowLight() {
 // ============================================================
 // VENTILATION CONTROL
 // ============================================================
+//
+// Priority:
+// 1. SAFETY        -> 100% open
+// 2. MANUAL        -> 100% open / locked
+// 3. AUTOMATION    -> indoor + outdoor temperature logic
+// ============================================================
 
 void controlVentilation() {
 
-  // Safety has highest priority.
+  // ----------------------------------------------------------
+  // PRIORITY 1: SAFETY
+  // ----------------------------------------------------------
+
   if (safetyMode) {
+
+    hotInsideColdOutside = false;
 
     ventPosition = SAFE_VENT_POSITION;
     ventServo.write(SAFE_VENT_POSITION);
@@ -558,9 +660,36 @@ void controlVentilation() {
     return;
   }
 
-  if (!dhtValid) {
+  // ----------------------------------------------------------
+  // PRIORITY 2: MANUAL OVERRIDE
+  // ----------------------------------------------------------
+
+  if (currentMode == MANUAL_MODE) {
+
+    hotInsideColdOutside = false;
+
+    ventPosition = 100;
+    ventServo.write(100);
+
     return;
   }
+
+  // ----------------------------------------------------------
+  // PRIORITY 3: AUTOMATION
+  // ----------------------------------------------------------
+
+  if (currentMode != AUTOMATION_MODE) {
+    hotInsideColdOutside = false;
+    return;
+  }
+
+  if (!dhtValid) {
+    hotInsideColdOutside = false;
+    return;
+  }
+
+  // Start with the normal indoor-temperature rule.
+  hotInsideColdOutside = false;
 
   if (indoorTemperature >= 30.0) {
 
@@ -575,11 +704,55 @@ void controlVentilation() {
     ventPosition = 50;
   }
 
-  // Only automation mode changes the servo automatically.
-  if (currentMode == AUTOMATION_MODE) {
+  // ----------------------------------------------------------
+  // EXTREME CLIMATE CONFLICT
+  // HOT INSIDE + COLD OUTSIDE
+  // ----------------------------------------------------------
 
-    ventServo.write(ventPosition);
+  if (
+    outdoorValid &&
+    outdoorTemperature <= COLD_OUTDOOR_THRESHOLD &&
+    indoorTemperature >= 27.0
+  ) {
+
+    hotInsideColdOutside = true;
+
+    if (indoorTemperature >= 30.0) {
+
+      // Still ventilate a very hot nursery, but limit the opening
+      // because the outside environment is cold.
+      ventPosition = 75;
+
+    } else {
+
+      // Moderate overheating + cold outside:
+      // keep the vent at the lower controlled opening.
+      ventPosition = 50;
+    }
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println(" EXTREME CLIMATE CONDITION");
+    Serial.println(" HOT INSIDE + COLD OUTSIDE");
+    Serial.println("========================================");
+
+    Serial.print("Indoor: ");
+    Serial.print(indoorTemperature, 1);
+    Serial.println(" C");
+
+    Serial.print("Outdoor: ");
+    Serial.print(outdoorTemperature, 1);
+    Serial.println(" C");
+
+    Serial.print("Vent LIMITED to: ");
+    Serial.print(ventPosition);
+    Serial.println("%");
+
+    Serial.println("Reason: prevent excessive heat loss");
+    Serial.println("========================================");
   }
+
+  ventServo.write(ventPosition);
 
   Serial.println();
   Serial.println("--- Ventilation ---");
@@ -600,26 +773,27 @@ void controlBuzzer() {
 
   bool warning = false;
 
-  // High temperature warning
+  // Safety / emergency warning always has priority.
   if (
+    currentMode == EMERGENCY_MODE ||
+    safetyMode
+  ) {
+    warning = true;
+  }
+
+  // Normal environmental warnings only operate in AUTOMATION mode.
+  if (
+    currentMode == AUTOMATION_MODE &&
     dhtValid &&
     indoorTemperature >= 32.0
   ) {
     warning = true;
   }
 
-  // High humidity warning
   if (
+    currentMode == AUTOMATION_MODE &&
     dhtValid &&
     humidity >= 85.0
-  ) {
-    warning = true;
-  }
-
-  // Safety / emergency warning
-  if (
-    currentMode == EMERGENCY_MODE ||
-    safetyMode
   ) {
     warning = true;
   }
@@ -716,6 +890,171 @@ void updateStateLight() {
 }
 
 // ============================================================
+// MODE ENTRY FUNCTIONS
+// ============================================================
+//
+// These functions are used by BOTH the physical push buttons
+// and the UART commands, so the two control methods behave
+// exactly the same.
+//
+// AUTO button  -> GPIO32 -> GND
+// MANUAL button -> GPIO33 -> GND
+//
+// Both pins use INPUT_PULLUP:
+// HIGH = not pressed
+// LOW  = pressed
+//
+// No blocking delay is used.
+// ============================================================
+
+void enterAutomationMode() {
+
+  if (safetyMode) {
+
+    Serial.println();
+    Serial.println("AUTOMATION BLOCKED");
+    Serial.println("SYSTEM IS IN SAFETY MODE");
+    Serial.println("OPERATOR INTERVENTION REQUIRED");
+
+    return;
+  }
+
+  currentMode = AUTOMATION_MODE;
+
+  // Immediately hand actuator control back to automation.
+  controlGrowLight();
+  controlVentilation();
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("MODE CHANGED: AUTOMATION");
+  Serial.println("Automatic control resumed");
+  Serial.println("========================================");
+}
+
+void enterManualMode() {
+
+  if (safetyMode) {
+
+    Serial.println();
+    Serial.println("MANUAL MODE BLOCKED");
+    Serial.println("SYSTEM IS IN SAFETY MODE");
+    Serial.println("OPERATOR INTERVENTION REQUIRED");
+
+    return;
+  }
+
+  currentMode = MANUAL_MODE;
+
+  // Manual Override immediately locks the vent fully open.
+  ventPosition = 100;
+  ventServo.write(100);
+
+  // Automatic grow-light control is suspended.
+  digitalWrite(GROW_LED, LOW);
+
+  // Stop any normal warning tone already active.
+  noTone(BUZZER_PIN);
+  buzzerActive = false;
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("MODE CHANGED: MANUAL OVERRIDE");
+  Serial.println("AUTOMATION SUSPENDED");
+  Serial.println("VENT LOCKED OPEN: 100%");
+  Serial.println("========================================");
+}
+
+void handleModeButtons() {
+
+  unsigned long currentMillis = millis();
+
+  // ----------------------------------------------------------
+  // Read both physical buttons
+  // ----------------------------------------------------------
+
+  bool autoReading = digitalRead(AUTO_BUTTON);
+  bool manualReading = digitalRead(MANUAL_BUTTON);
+
+  // ----------------------------------------------------------
+  // AUTO button debounce
+  // ----------------------------------------------------------
+
+  if (autoReading != lastAutoButtonReading) {
+
+    autoButtonDebounceTime = currentMillis;
+    lastAutoButtonReading = autoReading;
+  }
+
+  if (
+    currentMillis - autoButtonDebounceTime >= BUTTON_DEBOUNCE &&
+    autoButtonState != autoReading
+  ) {
+
+    autoButtonState = autoReading;
+
+    // Falling edge = button was pressed.
+    if (autoButtonState == LOW) {
+
+      Serial.println();
+      Serial.println("PHYSICAL BUTTON: AUTO");
+
+      enterAutomationMode();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // MANUAL button debounce
+  // ----------------------------------------------------------
+
+  if (manualReading != lastManualButtonReading) {
+
+    manualButtonDebounceTime = currentMillis;
+    lastManualButtonReading = manualReading;
+  }
+
+  if (
+    currentMillis - manualButtonDebounceTime >= BUTTON_DEBOUNCE &&
+    manualButtonState != manualReading
+  ) {
+
+    manualButtonState = manualReading;
+
+    // Falling edge = button was pressed.
+    if (manualButtonState == LOW) {
+
+      Serial.println();
+      Serial.println("PHYSICAL BUTTON: MANUAL");
+
+      enterManualMode();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Non-blocking diagnostic output.
+  //
+  // This makes the physical wiring easy to verify:
+  // AUTO=HIGH / MANUAL=HIGH -> both released
+  // AUTO=LOW  / MANUAL=HIGH -> AUTO pressed
+  // AUTO=HIGH / MANUAL=LOW  -> MANUAL pressed
+  // ----------------------------------------------------------
+
+  if (
+    currentMillis - lastButtonDiagnostic >=
+    BUTTON_DIAGNOSTIC_INTERVAL
+  ) {
+
+    lastButtonDiagnostic = currentMillis;
+
+    Serial.print("BUTTONS | AUTO=");
+    Serial.print(digitalRead(AUTO_BUTTON));
+
+    Serial.print(" | MANUAL=");
+    Serial.println(digitalRead(MANUAL_BUTTON));
+  }
+}
+
+// ============================================================
 // SERIAL MODE CONTROL
 // ============================================================
 //
@@ -747,21 +1086,7 @@ void handleSerialCommands() {
     command == 'a'
   ) {
 
-    if (safetyMode) {
-
-      Serial.println();
-      Serial.println("AUTOMATION BLOCKED");
-      Serial.println("SYSTEM IS IN SAFETY MODE");
-      Serial.println("OPERATOR INTERVENTION REQUIRED");
-
-      return;
-    }
-
-    currentMode = AUTOMATION_MODE;
-
-    Serial.println();
-    Serial.println("MODE CHANGED: AUTOMATION");
-    Serial.println("State Light: OFF");
+    enterAutomationMode();
   }
 
   // ----------------------------------------------------------
@@ -773,21 +1098,7 @@ void handleSerialCommands() {
     command == 'm'
   ) {
 
-    if (safetyMode) {
-
-      Serial.println();
-      Serial.println("MANUAL MODE BLOCKED");
-      Serial.println("SYSTEM IS IN SAFETY MODE");
-      Serial.println("OPERATOR INTERVENTION REQUIRED");
-
-      return;
-    }
-
-    currentMode = MANUAL_MODE;
-
-    Serial.println();
-    Serial.println("MODE CHANGED: MANUAL OVERRIDE");
-    Serial.println("State Light: ON");
+    enterManualMode();
   }
 
   // ----------------------------------------------------------
@@ -801,9 +1112,99 @@ void handleSerialCommands() {
 
     currentMode = EMERGENCY_MODE;
 
+    ventPosition = SAFE_VENT_POSITION;
+    ventServo.write(SAFE_VENT_POSITION);
+
     Serial.println();
+    Serial.println("========================================");
     Serial.println("MODE CHANGED: EMERGENCY");
     Serial.println("State Light: BLINKING");
+    Serial.println("VENT: SAFE POSTURE");
+    Serial.println("========================================");
+  }
+
+  // ----------------------------------------------------------
+  // STATUS
+  // ----------------------------------------------------------
+
+  else if (
+    command == 'S' ||
+    command == 's'
+  ) {
+
+    Serial.println();
+    Serial.println("============== SYSTEM STATUS ===========");
+
+    Serial.print("Mode: ");
+
+    if (currentMode == AUTOMATION_MODE) {
+      Serial.println("AUTOMATION");
+    } else if (currentMode == MANUAL_MODE) {
+      Serial.println("MANUAL OVERRIDE");
+    } else {
+      Serial.println("EMERGENCY / SAFETY");
+    }
+
+    Serial.print("Indoor Temperature: ");
+    if (dhtValid) Serial.print(indoorTemperature, 1);
+    else Serial.print("ERROR");
+    Serial.println(" C");
+
+    Serial.print("Humidity: ");
+    if (dhtValid) Serial.print(humidity, 1);
+    else Serial.print("ERROR");
+    Serial.println(" %");
+
+    Serial.print("Outdoor Temperature: ");
+    if (outdoorValid) Serial.print(outdoorTemperature, 1);
+    else Serial.print("ERROR");
+    Serial.println(" C");
+
+    Serial.print("Light Level: ");
+    Serial.print(lightPercentage);
+    Serial.println(" %");
+
+    Serial.print("Vent Position: ");
+    Serial.print(ventPosition);
+    Serial.println("%");
+
+    Serial.print("Hot Inside / Cold Outside: ");
+    Serial.println(hotInsideColdOutside ? "YES" : "NO");
+
+    Serial.println("========================================");
+  }
+
+  // ----------------------------------------------------------
+  // SAFETY RESET
+  // ----------------------------------------------------------
+  // R only clears Safety/Error when both required sensors are
+  // currently valid. The system then returns to Automation.
+
+  else if (
+    command == 'R' ||
+    command == 'r'
+  ) {
+
+    if (
+      dhtReadAttempted &&
+      dhtValid &&
+      outdoorReadAttempted &&
+      outdoorValid
+    ) {
+
+      safetyMode = false;
+      currentMode = AUTOMATION_MODE;
+
+      Serial.println();
+      Serial.println("SAFETY RESET ACCEPTED");
+      Serial.println("Sensors valid");
+      Serial.println("MODE: AUTOMATION");
+    } else {
+
+      Serial.println();
+      Serial.println("SAFETY RESET BLOCKED");
+      Serial.println("Wait for valid DHT22 and DS18B20 readings");
+    }
   }
 }
 
@@ -929,7 +1330,35 @@ void updateOLED() {
   }
 
   // ----------------------------------------------------------
-  // NORMAL SCREEN
+  // MANUAL OVERRIDE SCREEN
+  // ----------------------------------------------------------
+
+  if (currentMode == MANUAL_MODE) {
+
+    display.setCursor(0, 0);
+    display.println("MANUAL OVERRIDE");
+
+    display.setCursor(0, 12);
+    display.println("AUTOMATION STOPPED");
+
+    display.setCursor(0, 24);
+    display.println("VENT: LOCKED OPEN");
+
+    display.setCursor(0, 36);
+    display.print("VENT: ");
+    display.print(ventPosition);
+    display.println("%");
+
+    display.setCursor(0, 48);
+    display.println("AUTO = RESUME");
+
+    display.display();
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // NORMAL AUTOMATION SCREEN
   // ----------------------------------------------------------
 
   display.setCursor(0, 0);
@@ -983,20 +1412,18 @@ void updateOLED() {
   display.print(lightPercentage);
   display.println(" %");
 
-  // Mode
+  // Mode / climate status
   display.setCursor(0, 52);
 
-  if (currentMode == AUTOMATION_MODE) {
+  if (hotInsideColdOutside) {
 
-    display.print("AUTO");
-
-  } else if (currentMode == MANUAL_MODE) {
-
-    display.print("MANUAL");
+    display.print("HOT/COLD LIMIT");
 
   } else {
 
-    display.print("EMERGENCY");
+    display.print("AUTO VENT: ");
+    display.print(ventPosition);
+    display.print("%");
   }
 
   display.display();
@@ -1009,6 +1436,12 @@ void updateOLED() {
 void loop() {
 
   unsigned long currentMillis = millis();
+
+  // ----------------------------------------------------------
+  // Physical AUTO / MANUAL buttons
+  // ----------------------------------------------------------
+
+  handleModeButtons();
 
   // ----------------------------------------------------------
   // Serial commands
