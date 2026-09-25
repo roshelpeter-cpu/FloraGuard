@@ -1,10 +1,9 @@
 /**
  * @file sketch.ino
- * @brief FloraGuard sensor monitoring with I2C OLED display.
+ * @brief FloraGuard environmental monitoring with servo ventilation.
  *
  * @details
- * Commit 4 adds the SSD1306 I2C OLED display while
- * retaining DHT22, LDR and DS18B20 monitoring.
+ * Commit 5 adds PWM servo control for the automated nursery vent.
  */
 
 #include "DHTesp.h"
@@ -13,55 +12,50 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
 
 // --------------------------------------------------
 // Pin definitions
 // --------------------------------------------------
 
-/** @brief DHT22 data pin. */
 const int DHT_PIN = 15;
-
-/** @brief LDR analogue output pin. */
 const int LDR_PIN = 34;
-
-/** @brief DS18B20 data pin. */
 const int DS18B20_PIN = 16;
 
-/** @brief OLED I2C SDA pin. */
 const int OLED_SDA = 21;
-
-/** @brief OLED I2C SCL pin. */
 const int OLED_SCL = 22;
 
-/** @brief OLED display width. */
+const int SERVO_PIN = 27;
+
 const int SCREEN_WIDTH = 128;
-
-/** @brief OLED display height. */
 const int SCREEN_HEIGHT = 64;
-
-/** @brief OLED I2C address. */
 const int OLED_ADDRESS = 0x3C;
 
 // --------------------------------------------------
 // Sensor objects
 // --------------------------------------------------
 
-/** @brief DHT22 sensor object. */
 DHTesp dht;
 
-/** @brief OneWire communication bus. */
 OneWire oneWire(DS18B20_PIN);
 
-/** @brief DS18B20 sensor object. */
 DallasTemperature outdoorSensor(&oneWire);
 
 // --------------------------------------------------
-// OLED object
+// Servo
 // --------------------------------------------------
 
+Servo ventServo;
+
 /**
- * @brief SSD1306 OLED display object.
+ * @brief Current vent opening percentage.
  */
+int ventPercent = 0;
+
+// --------------------------------------------------
+// OLED
+// --------------------------------------------------
+
 Adafruit_SSD1306 display(
     SCREEN_WIDTH,
     SCREEN_HEIGHT,
@@ -73,9 +67,6 @@ Adafruit_SSD1306 display(
 // Setup
 // --------------------------------------------------
 
-/**
- * @brief Initialises sensors, OLED and serial communication.
- */
 void setup()
 {
   Serial.begin(115200);
@@ -89,7 +80,7 @@ void setup()
   // DS18B20
   outdoorSensor.begin();
 
-  // OLED I2C
+  // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
 
   if (!display.begin(
@@ -100,24 +91,35 @@ void setup()
 
     while (true)
     {
-      // Stop here if OLED initialisation fails.
     }
   }
 
+  // Servo
+  ventServo.attach(SERVO_PIN);
+
+  // Start with vent closed
+  ventServo.write(0);
+  ventPercent = 0;
+
+  // Startup display
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-
   display.setTextSize(1);
+
   display.setCursor(0, 0);
   display.println("FLORAGUARD");
-  display.println();
+
+  display.setCursor(0, 15);
   display.println("System Starting...");
+
+  display.setCursor(0, 30);
+  display.println("Vent: 0%");
+
   display.display();
 
   Serial.println();
   Serial.println("================================");
-  Serial.println("FLORAGUARD - OLED TEST");
-  Serial.println("DHT22 + LDR + DS18B20");
+  Serial.println("FLORAGUARD - SERVO TEST");
   Serial.println("================================");
 }
 
@@ -125,14 +127,6 @@ void setup()
 // OLED update
 // --------------------------------------------------
 
-/**
- * @brief Updates the OLED with current sensor values.
- *
- * @param indoorTemp Indoor temperature in Celsius.
- * @param humidity Indoor relative humidity percentage.
- * @param outdoorTemp Outdoor temperature in Celsius.
- * @param lightPercent Estimated light percentage.
- */
 void updateDisplay(
     float indoorTemp,
     float humidity,
@@ -141,30 +135,36 @@ void updateDisplay(
 {
   display.clearDisplay();
 
+  display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
   display.setCursor(0, 0);
   display.println("FLORAGUARD");
 
-  display.setCursor(0, 13);
+  display.setCursor(0, 12);
   display.print("IN : ");
   display.print(indoorTemp, 1);
   display.println(" C");
 
-  display.setCursor(0, 25);
+  display.setCursor(0, 23);
   display.print("HUM: ");
   display.print(humidity, 1);
   display.println(" %");
 
-  display.setCursor(0, 37);
+  display.setCursor(0, 34);
   display.print("OUT: ");
   display.print(outdoorTemp, 1);
   display.println(" C");
 
-  display.setCursor(0, 49);
+  display.setCursor(0, 45);
   display.print("LGT: ");
   display.print(lightPercent);
   display.println(" %");
+
+  display.setCursor(0, 56);
+  display.print("VENT: ");
+  display.print(ventPercent);
+  display.println("%");
 
   display.display();
 }
@@ -173,19 +173,20 @@ void updateDisplay(
 // Main loop
 // --------------------------------------------------
 
-/**
- * @brief Reads sensors and updates the OLED display.
- */
 void loop()
 {
   // ==================================================
   // DHT22
   // ==================================================
 
-  TempAndHumidity dhtData = dht.getTempAndHumidity();
+  TempAndHumidity dhtData =
+      dht.getTempAndHumidity();
 
-  float indoorTemperature = dhtData.temperature;
-  float humidity = dhtData.humidity;
+  float indoorTemperature =
+      dhtData.temperature;
+
+  float humidity =
+      dhtData.humidity;
 
   if (dht.getStatus() != 0)
   {
@@ -207,16 +208,14 @@ void loop()
   // LDR
   // ==================================================
 
-  int lightRaw = analogRead(LDR_PIN);
+  int lightRaw =
+      analogRead(LDR_PIN);
 
   int lightPercent =
       map(lightRaw, 0, 4095, 0, 100);
 
   lightPercent =
       constrain(lightPercent, 0, 100);
-
-  Serial.print("LDR Raw ADC: ");
-  Serial.println(lightRaw);
 
   Serial.print("Light Level: ");
   Serial.print(lightPercent);
@@ -231,7 +230,8 @@ void loop()
   float outdoorTemperature =
       outdoorSensor.getTempCByIndex(0);
 
-  if (outdoorTemperature == DEVICE_DISCONNECTED_C ||
+  if (outdoorTemperature ==
+          DEVICE_DISCONNECTED_C ||
       outdoorTemperature < -55.0 ||
       outdoorTemperature > 125.0)
   {
@@ -248,6 +248,23 @@ void loop()
   }
 
   // ==================================================
+  // SERVO TEST
+  // ==================================================
+
+  // For this development stage, keep the vent
+  // at 50% open.
+  ventPercent = 75;
+
+  int servoAngle =
+      map(ventPercent, 0, 100, 0, 180);
+
+  ventServo.write(servoAngle);
+
+  Serial.print("Vent Position: ");
+  Serial.print(ventPercent);
+  Serial.println(" %");
+
+  // ==================================================
   // OLED
   // ==================================================
 
@@ -259,7 +276,5 @@ void loop()
 
   Serial.println("--------------------------------");
 
-  // Temporary development delay.
-  // Non-blocking timing will be implemented later.
   delay(2500);
 }
