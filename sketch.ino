@@ -1,16 +1,20 @@
 // ============================================================
-// FloraGuard - Automated Commercial Micro-Climate Nursery
-// Current Development Version
+// FloraGuard
+// Automated Commercial Micro-Climate Nursery
 //
-// Features implemented:
+// Current Features:
 // 1. DHT22 temperature & humidity
 // 2. LDR light sensing
 // 3. DS18B20 outdoor temperature
-// 4. I2C OLED environmental display
-// 5. Servo ventilation control
+// 4. I2C OLED display
+// 5. Servo ventilation
 // 6. Buzzer alerts
+// 7. Grow light control
+// 8. Status LED
 //
-// LEDs are temporarily NOT used.
+// IMPORTANT:
+// No delay() is used.
+// Timing is handled using millis().
 // ============================================================
 
 #include <DHTesp.h>
@@ -21,17 +25,14 @@
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
 
+
 // ============================================================
 // PIN DEFINITIONS
 // ============================================================
 
-// DHT22
+// Sensors
 const int DHT_PIN = 15;
-
-// LDR
 const int LDR_PIN = 34;
-
-// DS18B20
 const int DS18B20_PIN = 16;
 
 // OLED
@@ -44,9 +45,14 @@ const int SERVO_PIN = 27;
 // Buzzer
 const int BUZZER_PIN = 25;
 
+// LEDs
+const int GROW_LED_1 = 23;
+const int GROW_LED_2 = 19;
+const int STATUS_LED = 18;
+
 
 // ============================================================
-// OLED SETTINGS
+// OLED
 // ============================================================
 
 #define SCREEN_WIDTH 128
@@ -74,24 +80,82 @@ Servo ventServo;
 
 
 // ============================================================
-// VARIABLES
+// SENSOR VARIABLES
 // ============================================================
 
-float indoorTemperature = 0.0;
-float humidity = 0.0;
-float outdoorTemperature = 0.0;
+float indoorTemperature = NAN;
+float humidity = NAN;
+float outdoorTemperature = NAN;
 
 int ldrValue = 0;
 int lightPercentage = 0;
+
+
+// ============================================================
+// SERVO VARIABLES
+// ============================================================
 
 int ventPosition = 50;
 
 
 // ============================================================
-// BUZZER SETTINGS
+// TIMING VARIABLES
 // ============================================================
 
-bool buzzerTestDone = false;
+// DHT22
+unsigned long lastDHTRead = 0;
+const unsigned long DHT_INTERVAL = 2500;
+
+// LDR
+unsigned long lastLDRRead = 0;
+const unsigned long LDR_INTERVAL = 250;
+
+// DS18B20
+unsigned long lastDSRequest = 0;
+unsigned long dsConversionStart = 0;
+
+const unsigned long DS_INTERVAL = 2000;
+const unsigned long DS_CONVERSION_TIME = 800;
+
+bool dsConversionRunning = false;
+
+// OLED
+unsigned long lastOLEDUpdate = 0;
+const unsigned long OLED_INTERVAL = 500;
+
+// LED status
+unsigned long lastStatusBlink = 0;
+const unsigned long STATUS_BLINK_INTERVAL = 500;
+
+bool statusLEDState = false;
+
+// Buzzer
+unsigned long buzzerStartTime = 0;
+unsigned long lastBuzzerEvent = 0;
+
+const unsigned long BUZZER_INTERVAL = 1500;
+const unsigned long BUZZER_DURATION = 200;
+
+bool buzzerActive = false;
+
+
+// ============================================================
+// STARTUP BUZZER
+// ============================================================
+
+int startupBeepStep = 0;
+
+unsigned long startupBeepTimer = 0;
+
+bool startupComplete = false;
+
+
+// ============================================================
+// SENSOR STATUS
+// ============================================================
+
+bool dhtValid = false;
+bool outdoorValid = false;
 
 
 // ============================================================
@@ -105,7 +169,7 @@ void setup() {
   Serial.println();
   Serial.println("========================================");
   Serial.println(" FloraGuard Nursery System");
-  Serial.println(" System Starting...");
+  Serial.println(" Starting...");
   Serial.println("========================================");
 
 
@@ -113,7 +177,10 @@ void setup() {
   // DHT22
   // ----------------------------------------------------------
 
-  dht.setup(DHT_PIN, DHTesp::DHT22);
+  dht.setup(
+    DHT_PIN,
+    DHTesp::DHT22
+  );
 
   Serial.println("DHT22 initialized");
 
@@ -122,7 +189,10 @@ void setup() {
   // LDR
   // ----------------------------------------------------------
 
-  pinMode(LDR_PIN, INPUT);
+  pinMode(
+    LDR_PIN,
+    INPUT
+  );
 
   Serial.println("LDR initialized");
 
@@ -133,6 +203,8 @@ void setup() {
 
   outdoorSensor.begin();
 
+  outdoorSensor.setWaitForConversion(false);
+
   Serial.println("DS18B20 initialized");
 
 
@@ -140,7 +212,10 @@ void setup() {
   // OLED
   // ----------------------------------------------------------
 
-  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.begin(
+    OLED_SDA,
+    OLED_SCL
+  );
 
   if (!display.begin(
         SSD1306_SWITCHCAPVCC,
@@ -165,8 +240,6 @@ void setup() {
     display.println("System Starting...");
 
     display.display();
-
-    delay(1500);
   }
 
 
@@ -174,9 +247,15 @@ void setup() {
   // SERVO
   // ----------------------------------------------------------
 
-  ventServo.attach(SERVO_PIN);
+  ventServo.attach(
+    SERVO_PIN
+  );
 
-  ventServo.write(ventPosition);
+  ventPosition = 50;
+
+  ventServo.write(
+    ventPosition
+  );
 
   Serial.println("Servo initialized");
   Serial.println("Vent position: 50%");
@@ -186,41 +265,78 @@ void setup() {
   // BUZZER
   // ----------------------------------------------------------
 
-  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(
+    BUZZER_PIN,
+    OUTPUT
+  );
 
-  digitalWrite(BUZZER_PIN, LOW);
+  noTone(
+    BUZZER_PIN
+  );
 
   Serial.println("Buzzer initialized");
+
+
+  // ----------------------------------------------------------
+  // LEDS
+  // ----------------------------------------------------------
+
+  pinMode(
+    GROW_LED_1,
+    OUTPUT
+  );
+
+  pinMode(
+    GROW_LED_2,
+    OUTPUT
+  );
+
+  pinMode(
+    STATUS_LED,
+    OUTPUT
+  );
+
+
+  // Start all LEDs OFF
+  digitalWrite(
+    GROW_LED_1,
+    LOW
+  );
+
+  digitalWrite(
+    GROW_LED_2,
+    LOW
+  );
+
+  digitalWrite(
+    STATUS_LED,
+    LOW
+  );
+
+
+  Serial.println("LEDs initialized");
+
+
+  // ----------------------------------------------------------
+  // START DS18B20 CONVERSION
+  // ----------------------------------------------------------
+
+  outdoorSensor.requestTemperatures();
+
+  lastDSRequest = millis();
+
+  dsConversionStart = millis();
+
+  dsConversionRunning = true;
 
 
   // ----------------------------------------------------------
   // STARTUP BUZZER
   // ----------------------------------------------------------
 
-  Serial.println("Buzzer startup test");
+  startupBeepTimer = millis();
 
-  tone(BUZZER_PIN, 1000);
-
-  delay(300);
-
-  noTone(BUZZER_PIN);
-
-  delay(200);
-
-
-  tone(BUZZER_PIN, 1500);
-
-  delay(300);
-
-  noTone(BUZZER_PIN);
-
-
-  Serial.println("Buzzer test complete");
-
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println(" FloraGuard Ready");
-  Serial.println("========================================");
+  Serial.println("Startup sequence running...");
 }
 
 
@@ -230,22 +346,57 @@ void setup() {
 
 void readDHT22() {
 
-  TempAndHumidity data = dht.getTempAndHumidity();
-
-  indoorTemperature = data.temperature;
-  humidity = data.humidity;
+  TempAndHumidity data =
+    dht.getTempAndHumidity();
 
 
-  Serial.println();
-  Serial.println("--- DHT22 ---");
+  indoorTemperature =
+    data.temperature;
 
-  Serial.print("Indoor Temperature: ");
-  Serial.print(indoorTemperature);
-  Serial.println(" C");
+  humidity =
+    data.humidity;
 
-  Serial.print("Humidity: ");
-  Serial.print(humidity);
-  Serial.println(" %");
+
+  // Check sensor values
+  if (
+    isnan(indoorTemperature) ||
+    isnan(humidity)
+  ) {
+
+    dhtValid = false;
+
+    Serial.println(
+      "ERROR: DHT22 reading invalid"
+    );
+
+  } else {
+
+    dhtValid = true;
+
+    Serial.println();
+    Serial.println("--- DHT22 ---");
+
+    Serial.print(
+      "Indoor Temperature: "
+    );
+
+    Serial.print(
+      indoorTemperature
+    );
+
+    Serial.println(" C");
+
+
+    Serial.print(
+      "Humidity: "
+    );
+
+    Serial.print(
+      humidity
+    );
+
+    Serial.println(" %");
+  }
 }
 
 
@@ -255,112 +406,218 @@ void readDHT22() {
 
 void readLDR() {
 
-  ldrValue = analogRead(LDR_PIN);
+  ldrValue =
+    analogRead(
+      LDR_PIN
+    );
 
 
-  // Convert ADC value to percentage
-  lightPercentage = map(
-    ldrValue,
-    0,
-    4095,
-    0,
-    100
-  );
+  lightPercentage =
+    map(
+      ldrValue,
+      0,
+      4095,
+      0,
+      100
+    );
 
 
-  lightPercentage = constrain(
-    lightPercentage,
-    0,
-    100
-  );
+  lightPercentage =
+    constrain(
+      lightPercentage,
+      0,
+      100
+    );
 
 
   Serial.println();
   Serial.println("--- LDR ---");
 
-  Serial.print("ADC Value: ");
-  Serial.println(ldrValue);
+  Serial.print(
+    "ADC Value: "
+  );
 
-  Serial.print("Light Level: ");
-  Serial.print(lightPercentage);
+  Serial.println(
+    ldrValue
+  );
+
+
+  Serial.print(
+    "Light Level: "
+  );
+
+  Serial.print(
+    lightPercentage
+  );
+
   Serial.println(" %");
 }
 
 
 // ============================================================
-// READ DS18B20
+// DS18B20
+// NON-BLOCKING READING
 // ============================================================
 
-void readOutdoorTemperature() {
+void handleDS18B20() {
 
-  outdoorSensor.requestTemperatures();
-
-  outdoorTemperature =
-    outdoorSensor.getTempCByIndex(0);
+  unsigned long currentMillis =
+    millis();
 
 
-  Serial.println();
-  Serial.println("--- DS18B20 ---");
+  // ----------------------------------------------------------
+  // Start a new conversion
+  // ----------------------------------------------------------
 
-  Serial.print("Outdoor Temperature: ");
-  Serial.print(outdoorTemperature);
-  Serial.println(" C");
+  if (
+    !dsConversionRunning &&
+    currentMillis - lastDSRequest >= DS_INTERVAL
+  ) {
+
+    outdoorSensor.requestTemperatures();
+
+    dsConversionStart =
+      currentMillis;
+
+    lastDSRequest =
+      currentMillis;
+
+    dsConversionRunning =
+      true;
+  }
+
+
+  // ----------------------------------------------------------
+  // Check if conversion is complete
+  // ----------------------------------------------------------
+
+  if (
+    dsConversionRunning &&
+    currentMillis - dsConversionStart >=
+      DS_CONVERSION_TIME
+  ) {
+
+    outdoorTemperature =
+      outdoorSensor.getTempCByIndex(0);
+
+
+    if (
+      outdoorTemperature == DEVICE_DISCONNECTED_C ||
+      outdoorTemperature < -55 ||
+      outdoorTemperature > 125
+    ) {
+
+      outdoorValid = false;
+
+      Serial.println(
+        "ERROR: DS18B20 reading invalid"
+      );
+
+    } else {
+
+      outdoorValid = true;
+
+      Serial.println();
+      Serial.println("--- DS18B20 ---");
+
+      Serial.print(
+        "Outdoor Temperature: "
+      );
+
+      Serial.print(
+        outdoorTemperature
+      );
+
+      Serial.println(" C");
+    }
+
+
+    dsConversionRunning =
+      false;
+  }
 }
 
 
 // ============================================================
-// UPDATE OLED
+// GROW LIGHT CONTROL
+// ============================================================
+//
+// Light level:
+//
+// 0 - 30%
+// BOTH grow LEDs ON
+//
+// 30 - 60%
+// ONE grow LED ON
+//
+// 60 - 100%
+// BOTH grow LEDs OFF
+//
 // ============================================================
 
-void updateOLED() {
+void controlGrowLights() {
 
-  display.clearDisplay();
+  if (lightPercentage < 30) {
 
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+    // Very dark
+    // Full grow lighting
 
+    digitalWrite(
+      GROW_LED_1,
+      HIGH
+    );
 
-  // Title
-  display.setCursor(0, 0);
-  display.println("FloraGuard");
-
-
-  // Indoor temperature
-  display.setCursor(0, 12);
-  display.print("Indoor: ");
-  display.print(indoorTemperature, 1);
-  display.println(" C");
+    digitalWrite(
+      GROW_LED_2,
+      HIGH
+    );
 
 
-  // Humidity
-  display.setCursor(0, 22);
-  display.print("Humidity: ");
-  display.print(humidity, 1);
-  display.println(" %");
+    Serial.println(
+      "Grow Light: FULL"
+    );
+  }
+
+  else if (lightPercentage < 60) {
+
+    // Medium light
+    // Half grow lighting
+
+    digitalWrite(
+      GROW_LED_1,
+      HIGH
+    );
+
+    digitalWrite(
+      GROW_LED_2,
+      LOW
+    );
 
 
-  // Outdoor temperature
-  display.setCursor(0, 32);
-  display.print("Outdoor: ");
-  display.print(outdoorTemperature, 1);
-  display.println(" C");
+    Serial.println(
+      "Grow Light: HALF"
+    );
+  }
+
+  else {
+
+    // Sufficient natural light
+
+    digitalWrite(
+      GROW_LED_1,
+      LOW
+    );
+
+    digitalWrite(
+      GROW_LED_2,
+      LOW
+    );
 
 
-  // Light
-  display.setCursor(0, 42);
-  display.print("Light: ");
-  display.print(lightPercentage);
-  display.println(" %");
-
-
-  // Vent
-  display.setCursor(0, 52);
-  display.print("Vent: ");
-  display.print(ventPosition);
-  display.println("%");
-
-
-  display.display();
+    Serial.println(
+      "Grow Light: OFF"
+    );
+  }
 }
 
 
@@ -370,80 +627,547 @@ void updateOLED() {
 
 void controlVentilation() {
 
-  // Basic development-stage ventilation logic
-  //
-  // If indoor temperature is high,
-  // open the vent.
-  //
-  // Otherwise keep the vent at 50%.
+  if (!dhtValid) {
 
-  if (indoorTemperature >= 30.0) {
-
-    ventPosition = 100;
-
+    return;
   }
 
-  else if (indoorTemperature >= 27.0) {
 
-    ventPosition = 75;
+  // ----------------------------------------------------------
+  // High temperature
+  // ----------------------------------------------------------
 
+  if (
+    indoorTemperature >= 30.0
+  ) {
+
+    ventPosition =
+      100;
   }
+
+
+  // ----------------------------------------------------------
+  // Warm
+  // ----------------------------------------------------------
+
+  else if (
+    indoorTemperature >= 27.0
+  ) {
+
+    ventPosition =
+      75;
+  }
+
+
+  // ----------------------------------------------------------
+  // Normal
+  // ----------------------------------------------------------
 
   else {
 
-    ventPosition = 50;
+    ventPosition =
+      50;
   }
 
 
-  ventServo.write(ventPosition);
+  ventServo.write(
+    ventPosition
+  );
 
 
   Serial.println();
   Serial.println("--- Ventilation ---");
 
-  Serial.print("Vent Position: ");
-  Serial.print(ventPosition);
+  Serial.print(
+    "Vent Position: "
+  );
+
+  Serial.print(
+    ventPosition
+  );
+
   Serial.println("%");
 }
 
 
 // ============================================================
-// BUZZER ALERT
+// BUZZER CONTROL
+// NON-BLOCKING
 // ============================================================
 
-void checkBuzzer() {
+void controlBuzzer() {
 
-  // High temperature warning
+  unsigned long currentMillis =
+    millis();
 
-  if (indoorTemperature >= 32.0) {
 
-    Serial.println("WARNING: High indoor temperature!");
+  bool warning =
+    false;
 
-    tone(BUZZER_PIN, 2000);
 
-    delay(200);
+  // High temperature
+  if (
+    dhtValid &&
+    indoorTemperature >= 32.0
+  ) {
 
-    noTone(BUZZER_PIN);
-
+    warning = true;
   }
 
-  // Very high humidity warning
 
-  else if (humidity >= 85.0) {
+  // High humidity
+  if (
+    dhtValid &&
+    humidity >= 85.0
+  ) {
 
-    Serial.println("WARNING: High humidity!");
+    warning = true;
+  }
 
-    tone(BUZZER_PIN, 1500);
 
-    delay(200);
+  // ----------------------------------------------------------
+  // Warning active
+  // ----------------------------------------------------------
 
-    noTone(BUZZER_PIN);
+  if (warning) {
+
+    if (
+      !buzzerActive &&
+      currentMillis - lastBuzzerEvent >=
+        BUZZER_INTERVAL
+    ) {
+
+      tone(
+        BUZZER_PIN,
+        2000
+      );
+
+      buzzerActive = true;
+
+      buzzerStartTime =
+        currentMillis;
+
+      lastBuzzerEvent =
+        currentMillis;
+
+
+      Serial.println(
+        "BUZZER: WARNING"
+      );
+    }
+
+
+    if (
+      buzzerActive &&
+      currentMillis - buzzerStartTime >=
+        BUZZER_DURATION
+    ) {
+
+      noTone(
+        BUZZER_PIN
+      );
+
+      buzzerActive = false;
+    }
   }
 
   else {
 
-    noTone(BUZZER_PIN);
+    if (buzzerActive) {
+
+      noTone(
+        BUZZER_PIN
+      );
+
+      buzzerActive = false;
+    }
   }
+}
+
+
+// ============================================================
+// STATUS LED
+// ============================================================
+//
+// Normal:
+// ON
+//
+// Warning:
+// Blink
+//
+// Sensor fault:
+// Fast blink
+//
+// ============================================================
+
+void updateStatusLED() {
+
+  unsigned long currentMillis =
+    millis();
+
+
+  bool sensorFault =
+    !dhtValid;
+
+
+  bool warning =
+    dhtValid &&
+    (
+      indoorTemperature >= 32.0 ||
+      humidity >= 85.0
+    );
+
+
+  // ----------------------------------------------------------
+  // Sensor fault
+  // ----------------------------------------------------------
+
+  if (sensorFault) {
+
+    if (
+      currentMillis - lastStatusBlink >= 150
+    ) {
+
+      lastStatusBlink =
+        currentMillis;
+
+      statusLEDState =
+        !statusLEDState;
+
+      digitalWrite(
+        STATUS_LED,
+        statusLEDState
+      );
+    }
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Warning
+  // ----------------------------------------------------------
+
+  if (warning) {
+
+    if (
+      currentMillis - lastStatusBlink >=
+        STATUS_BLINK_INTERVAL
+    ) {
+
+      lastStatusBlink =
+        currentMillis;
+
+      statusLEDState =
+        !statusLEDState;
+
+      digitalWrite(
+        STATUS_LED,
+        statusLEDState
+      );
+    }
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Normal
+  // ----------------------------------------------------------
+
+  statusLEDState =
+    true;
+
+  digitalWrite(
+    STATUS_LED,
+    HIGH
+  );
+}
+
+
+// ============================================================
+// STARTUP BUZZER
+// NON-BLOCKING
+// ============================================================
+
+void handleStartupBuzzer() {
+
+  unsigned long currentMillis =
+    millis();
+
+
+  if (startupComplete) {
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Step 0
+  // First beep
+  // ----------------------------------------------------------
+
+  if (
+    startupBeepStep == 0
+  ) {
+
+    tone(
+      BUZZER_PIN,
+      1000
+    );
+
+    startupBeepTimer =
+      currentMillis;
+
+    startupBeepStep =
+      1;
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Step 1
+  // End first beep
+  // ----------------------------------------------------------
+
+  if (
+    startupBeepStep == 1 &&
+    currentMillis - startupBeepTimer >= 300
+  ) {
+
+    noTone(
+      BUZZER_PIN
+    );
+
+    startupBeepTimer =
+      currentMillis;
+
+    startupBeepStep =
+      2;
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Step 2
+  // Wait before second beep
+  // ----------------------------------------------------------
+
+  if (
+    startupBeepStep == 2 &&
+    currentMillis - startupBeepTimer >= 200
+  ) {
+
+    tone(
+      BUZZER_PIN,
+      1500
+    );
+
+    startupBeepTimer =
+      currentMillis;
+
+    startupBeepStep =
+      3;
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Step 3
+  // End second beep
+  // ----------------------------------------------------------
+
+  if (
+    startupBeepStep == 3 &&
+    currentMillis - startupBeepTimer >= 300
+  ) {
+
+    noTone(
+      BUZZER_PIN
+    );
+
+    startupComplete =
+      true;
+
+    Serial.println(
+      "Startup sequence complete"
+    );
+  }
+}
+
+
+// ============================================================
+// OLED DISPLAY
+// ============================================================
+
+void updateOLED() {
+
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+
+  // ----------------------------------------------------------
+  // Title
+  // ----------------------------------------------------------
+
+  display.setCursor(
+    0,
+    0
+  );
+
+  display.println(
+    "FloraGuard"
+  );
+
+
+  // ----------------------------------------------------------
+  // Indoor temperature
+  // ----------------------------------------------------------
+
+  display.setCursor(
+    0,
+    12
+  );
+
+  display.print(
+    "Indoor: "
+  );
+
+  if (dhtValid) {
+
+    display.print(
+      indoorTemperature,
+      1
+    );
+
+    display.println(
+      " C"
+    );
+
+  } else {
+
+    display.println(
+      "ERROR"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Humidity
+  // ----------------------------------------------------------
+
+  display.setCursor(
+    0,
+    22
+  );
+
+  display.print(
+    "Humidity: "
+  );
+
+  if (dhtValid) {
+
+    display.print(
+      humidity,
+      1
+    );
+
+    display.println(
+      " %"
+    );
+
+  } else {
+
+    display.println(
+      "ERROR"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Outdoor temperature
+  // ----------------------------------------------------------
+
+  display.setCursor(
+    0,
+    32
+  );
+
+  display.print(
+    "Outdoor: "
+  );
+
+  if (outdoorValid) {
+
+    display.print(
+      outdoorTemperature,
+      1
+    );
+
+    display.println(
+      " C"
+    );
+
+  } else {
+
+    display.println(
+      "ERROR"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Light
+  // ----------------------------------------------------------
+
+  display.setCursor(
+    0,
+    42
+  );
+
+  display.print(
+    "Light: "
+  );
+
+  display.print(
+    lightPercentage
+  );
+
+  display.println(
+    " %"
+  );
+
+
+  // ----------------------------------------------------------
+  // Vent
+  // ----------------------------------------------------------
+
+  display.setCursor(
+    0,
+    52
+  );
+
+  display.print(
+    "Vent: "
+  );
+
+  display.print(
+    ventPosition
+  );
+
+  display.println(
+    "%"
+  );
+
+
+  display.display();
 }
 
 
@@ -453,41 +1177,96 @@ void checkBuzzer() {
 
 void loop() {
 
-  // ----------------------------------------------------------
-  // Read sensors
-  // ----------------------------------------------------------
-
-  readDHT22();
-
-  readLDR();
-
-  readOutdoorTemperature();
+  unsigned long currentMillis =
+    millis();
 
 
   // ----------------------------------------------------------
-  // Control ventilation
+  // STARTUP BUZZER
+  // ----------------------------------------------------------
+
+  handleStartupBuzzer();
+
+
+  // ----------------------------------------------------------
+  // DHT22
+  // ----------------------------------------------------------
+
+  if (
+    currentMillis - lastDHTRead >=
+      DHT_INTERVAL
+  ) {
+
+    lastDHTRead =
+      currentMillis;
+
+    readDHT22();
+  }
+
+
+  // ----------------------------------------------------------
+  // LDR
+  // ----------------------------------------------------------
+
+  if (
+    currentMillis - lastLDRRead >=
+      LDR_INTERVAL
+  ) {
+
+    lastLDRRead =
+      currentMillis;
+
+    readLDR();
+  }
+
+
+  // ----------------------------------------------------------
+  // DS18B20
+  // ----------------------------------------------------------
+
+  handleDS18B20();
+
+
+  // ----------------------------------------------------------
+  // Grow lights
+  // ----------------------------------------------------------
+
+  controlGrowLights();
+
+
+  // ----------------------------------------------------------
+  // Ventilation
   // ----------------------------------------------------------
 
   controlVentilation();
 
 
   // ----------------------------------------------------------
-  // Update OLED
+  // Buzzer
   // ----------------------------------------------------------
 
-  updateOLED();
-
-
-  // ----------------------------------------------------------
-  // Check alerts
-  // ----------------------------------------------------------
-
-  checkBuzzer();
+  controlBuzzer();
 
 
   // ----------------------------------------------------------
-  // Wait before next sensor cycle
+  // Status LED
   // ----------------------------------------------------------
 
-  delay(2500);
+  updateStatusLED();
+
+
+  // ----------------------------------------------------------
+  // OLED
+  // ----------------------------------------------------------
+
+  if (
+    currentMillis - lastOLEDUpdate >=
+      OLED_INTERVAL
+  ) {
+
+    lastOLEDUpdate =
+      currentMillis;
+
+    updateOLED();
+  }
 }
